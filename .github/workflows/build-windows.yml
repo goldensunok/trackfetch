@@ -1,0 +1,98 @@
+name: Build Trackfetch for Windows
+
+# You can start this by hand from the Actions tab: choose
+# "Build Trackfetch for Windows" on the left, then press "Run workflow".
+# It also runs automatically whenever the code changes.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    name: Run the tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install what the tests need
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run the test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+  build:
+    name: Build the Windows installer
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install what the build needs
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller==6.11.1
+
+      - name: Build Trackfetch.exe
+        run: pyinstaller packaging/trackfetch.spec --noconfirm --clean
+
+      - name: Check the program starts
+        run: |
+          if (-not (Test-Path "dist/Trackfetch/Trackfetch.exe")) {
+            throw "Trackfetch.exe was not produced"
+          }
+          Get-ChildItem dist/Trackfetch/Trackfetch.exe
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build TrackfetchSetup.exe
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup was not found" }
+          & $iscc packaging\installer.iss
+          if (-not (Test-Path "dist/installer/TrackfetchSetup.exe")) {
+            throw "TrackfetchSetup.exe was not produced"
+          }
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          # This is the file to download from the run page when it finishes.
+          name: TrackfetchSetup
+          path: dist/installer/TrackfetchSetup.exe
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach the installer to a release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/installer/TrackfetchSetup.exe
+          generate_release_notes: true
