@@ -128,6 +128,10 @@ class Settings:
     search_concurrency: int = 4
     result_limit: int = 250
     minimum_response_file_count: int = 1
+    #: Seconds to leave between starting one search and the next. Soulseek
+    #: searches go out across the whole network, and sending them off with no
+    #: gap is a reliable way to be dropped. Zero means no gap at all.
+    search_gap_seconds: float = 2.0
 
     # Interface
     theme: str = "system"
@@ -169,6 +173,7 @@ class Settings:
                 "search_concurrency": self.search_concurrency,
                 "result_limit": self.result_limit,
                 "minimum_response_file_count": self.minimum_response_file_count,
+                "search_gap_seconds": self.search_gap_seconds,
                 "theme": self.theme,
                 "confirm_before_download": self.confirm_before_download,
                 "filters": asdict(self.filters),
@@ -192,6 +197,7 @@ class Settings:
             "search_concurrency",
             "result_limit",
             "minimum_response_file_count",
+            "search_gap_seconds",
             "theme",
             "confirm_before_download",
             "filters",
@@ -214,6 +220,9 @@ class Settings:
         settings.result_limit = _clamp(data.get("result_limit", 250), 1, 5000, 250)
         settings.minimum_response_file_count = _clamp(
             data.get("minimum_response_file_count", 1), 1, 1000, 1
+        )
+        settings.search_gap_seconds = _clamp_float(
+            data.get("search_gap_seconds", 2.0), 0.0, 60.0, 2.0
         )
         settings.theme = str(data.get("theme", "system"))
         settings.confirm_before_download = bool(data.get("confirm_before_download", False))
@@ -247,6 +256,16 @@ def _clamp(value: Any, low: int, high: int, default: int) -> int:
     try:
         number = int(value)
     except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
+def _clamp_float(value: Any, low: float, high: float, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
         return default
     return max(low, min(high, number))
 

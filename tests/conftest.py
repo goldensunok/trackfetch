@@ -38,7 +38,26 @@ def settings():
 
     value = Settings()
     value.first_run_complete = True
+    # No pacing in tests: the gap is for being kind to the real Soulseek
+    # network, and waiting for it here would only make the suite slow. The
+    # pacing itself has its own tests, which set it deliberately.
+    value.search_gap_seconds = 0.0
     return value
+
+
+@pytest.fixture(scope="session")
+def qt_app():
+    """One offscreen Qt application for the whole session.
+
+    Qt refuses to build a second QApplication, and widgets cannot be created
+    without one. Nothing is shown: QT_QPA_PLATFORM=offscreen keeps it headless.
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtWidgets")
+    from PySide6.QtWidgets import QApplication
+
+    application = QApplication.instance() or QApplication([])
+    yield application
 
 
 @pytest.fixture

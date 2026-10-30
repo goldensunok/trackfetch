@@ -96,6 +96,15 @@ class ProviderRegistry:
                 self._instances[provider_id] = provider
             return provider
 
+    def existing(self, provider_id: str) -> Provider | None:
+        """A provider only if one has already been built. Never builds one.
+
+        Used at shutdown, where creating a provider just to ask it a question
+        would be the wrong thing to do.
+        """
+        with self._lock:
+            return self._instances.get(provider_id)
+
     def require(self, provider_id: str) -> Provider:
         provider = self.get(provider_id)
         if provider is None:

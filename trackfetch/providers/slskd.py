@@ -160,6 +160,10 @@ class SlskdProvider(Provider):
         return ready
 
     def test_connection(self) -> ConnectionStatus:
+        """A look, never a nudge. Safe for the automatic refresh to call."""
+        return self.check_connection(interactive=False)
+
+    def check_connection(self, interactive: bool = False) -> ConnectionStatus:
         if not self.enabled:
             return self._set_status(
                 ConnectionStatus(
@@ -176,7 +180,7 @@ class SlskdProvider(Provider):
                 "and password.",
             )
         try:
-            self.ensure_available()
+            self.ensure_available(allow_start=interactive)
         except TrackfetchError as exc:
             return self._status_from_error(exc)
         except Exception as exc:  # pragma: no cover - defensive
@@ -187,8 +191,11 @@ class SlskdProvider(Provider):
         except TrackfetchError as exc:
             return self._status_from_error(exc)
 
-        if not connected:
-            # One retry: slskd sometimes needs a nudge after a cold start.
+        if not connected and interactive:
+            # One nudge, and only because the user just asked for one by pressing
+            # a button. Doing this from the automatic refresh would cancel
+            # slskd's own patient reconnection schedule and force a fresh login
+            # attempt every single time the status was checked.
             self.client.connect_server()
             time.sleep(1.5)
             try:

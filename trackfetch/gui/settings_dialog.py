@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -365,7 +366,9 @@ class ProviderConfigDialog(QDialog):
             return
 
         self.runner.run(
-            provider.test_connection,
+            # interactive: the user pressed the button and is waiting, so a
+            # provider may repair itself rather than only report.
+            lambda p=provider: p.check_connection(interactive=True),
             on_result=self._show_test_result,
             on_error=lambda exc: (
                 show_problem(self, exc, "Test Connection"),
@@ -696,6 +699,23 @@ class SettingsDialog(QDialog):
         self.search_concurrency.valueChanged.connect(self._save_search)
         form.addRow("How many searches at once", self.search_concurrency)
 
+        self.search_gap = QDoubleSpinBox()
+        self.search_gap.setRange(0.0, 60.0)
+        self.search_gap.setSingleStep(0.5)
+        self.search_gap.setDecimals(1)
+        self.search_gap.setSuffix(" seconds")
+        self.search_gap.setValue(float(self.app.settings.search_gap_seconds))
+        self.search_gap.valueChanged.connect(self._save_search)
+        form.addRow("Pause between searches", self.search_gap)
+        form.addRow(
+            "",
+            _hint(
+                "Soulseek sends every search out across the whole network. A short "
+                "pause makes a long list far less likely to get you disconnected. "
+                "Set it to 0 for no pause."
+            ),
+        )
+
         self.result_limit = QSpinBox()
         self.result_limit.setRange(1, 5000)
         self.result_limit.setValue(self.app.settings.result_limit)
@@ -765,7 +785,10 @@ class SettingsDialog(QDialog):
             return
         widgets[1].setText("Checking...")
         # Soulseek may need its helper installed and started, not merely pinged.
-        work = self._prepare_soulseek if provider_id == "slskd" else provider.test_connection
+        if provider_id == "slskd":
+            work = self._prepare_soulseek
+        else:
+            work = lambda p=provider: p.check_connection(interactive=True)  # noqa: E731
         self.runner.run(
             work,
             on_result=lambda status, pid=provider_id: self._apply_status(pid, status),
@@ -828,6 +851,7 @@ class SettingsDialog(QDialog):
         self.app.settings.search_concurrency = self.search_concurrency.value()
         self.app.settings.result_limit = self.result_limit.value()
         self.app.settings.minimum_response_file_count = self.min_files.value()
+        self.app.settings.search_gap_seconds = float(self.search_gap.value())
         self.app.save_settings()
 
     def _save_filters(self, value: ResultFilter) -> None:

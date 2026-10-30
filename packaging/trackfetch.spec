@@ -98,7 +98,7 @@ if sys.platform == "darwin":
         icon=str(PROJECT_ROOT / "trackfetch" / "resources" / "trackfetch.ico"),
         bundle_identifier="org.trackfetch.app",
         info_plist={
-            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleShortVersionString": "1.0.1",
             "NSHighResolutionCapable": True,
         },
     )

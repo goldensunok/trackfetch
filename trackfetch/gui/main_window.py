@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
         self._batch_id: str = ""
         self._items_by_id: dict[str, BatchItem] = {}
         self._searching = False
+        self._search_total = 0
 
         self.setWindowTitle(f"{__app_name__} {__version__}")
         self.resize(1280, 860)
@@ -202,6 +203,15 @@ class MainWindow(QMainWindow):
         wizard_action = QAction("Run the setup guide again", self)
         wizard_action.triggered.connect(self.run_wizard)
         tools.addAction(wizard_action)
+
+        tools.addSeparator()
+        stop_helper = QAction("Stop the Soulseek helper", self)
+        stop_helper.setToolTip(
+            "Shuts down the background helper so your ordinary Soulseek program "
+            "can sign in. Trackfetch does this automatically when it closes."
+        )
+        stop_helper.triggered.connect(self.stop_soulseek_helper)
+        tools.addAction(stop_helper)
 
         help_menu = menu.addMenu("&Help")
         diagnostics = QAction("Copy Diagnostic Information", self)
@@ -407,6 +417,8 @@ class MainWindow(QMainWindow):
 
     def _set_searching(self, active: bool, total: int = 0) -> None:
         self._searching = active
+        if active:
+            self._search_total = total
         self.search_button.setEnabled(not active)
         self.stop_button.setEnabled(active)
         self.progress.setVisible(active)
@@ -435,11 +447,62 @@ class MainWindow(QMainWindow):
         self._set_searching(False)
         total = sum(len(o.candidates) for o in outcomes or [])
         failed = sum(1 for o in outcomes or [] if o.error)
+        halted = self.app.search_service.halted_reason
+        if halted:
+            # Stopping early is the right outcome, but the user must be told, or
+            # a batch of 92 that stopped at 7 just looks like it finished.
+            done = len(outcomes or [])
+            self.set_status(f"{halted} Stopped after {done} of {self._search_total}.")
+            self.connections.hint.setText(
+                f"{halted} {self.app.search_service.halted_remedy}".strip()
+            )
+            show_message(
+                self,
+                "Searching stopped",
+                halted,
+                f"{done} of {self._search_total} items were searched, and those "
+                f"results are kept. {self.app.search_service.halted_remedy}",
+            )
+            self.refresh_connections()
+            self.download_button.setEnabled(self.results_panel.selected_count() > 0)
+            return
         message = f"Search finished. {total} result{'s' if total != 1 else ''} found."
         if failed:
             message += f" {failed} item{'s' if failed != 1 else ''} could not be searched."
         self.set_status(message)
         self.download_button.setEnabled(self.results_panel.selected_count() > 0)
+
+    # -- the Soulseek helper -----------------------------------------------
+
+    def stop_soulseek_helper(self) -> None:
+        """Shut the helper down from the menu, so Task Manager is never needed."""
+        if not self.app.soulseek_helper_stoppable():
+            show_message(
+                self,
+                "Stop the Soulseek helper",
+                "There is no helper for Trackfetch to stop.",
+                "Either it is not running, or it is one you started yourself, in "
+                "which case Trackfetch leaves it alone.",
+            )
+            return
+        stopped = self.app.stop_soulseek_helper()
+        if stopped:
+            self.set_status("The Soulseek helper has been stopped.")
+            show_message(
+                self,
+                "Stop the Soulseek helper",
+                "The Soulseek helper has been stopped.",
+                "Your ordinary Soulseek program can sign in again now. Trackfetch "
+                "will start the helper again next time you search.",
+            )
+        else:
+            show_message(
+                self,
+                "Stop the Soulseek helper",
+                "Trackfetch could not stop the helper.",
+                "Use Copy Diagnostic Information and send the result on.",
+            )
+        self.refresh_connections()
 
     def _on_search_error(self, exc: Exception) -> None:
         self._set_searching(False)

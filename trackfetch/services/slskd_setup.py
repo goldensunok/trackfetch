@@ -73,6 +73,22 @@ def ensure_soulseek_ready(
 
     say("Checking whether the Soulseek helper is already running")
     already_running = supervisor.is_running(base_url)
+    if already_running:
+        # Say so rather than quietly adopting it. If it is not one Trackfetch
+        # started, Trackfetch will not stop it either, and the user needs to know
+        # that so a stray helper holding their Soulseek account is not a mystery.
+        if getattr(supervisor, "started_by_trackfetch", False):
+            say("A Soulseek helper from an earlier Trackfetch session is still running; reusing it")
+        else:
+            try:
+                supervisor.adopted_existing = True
+            except AttributeError:  # pragma: no cover - stand-ins in tests
+                pass
+            say(
+                "A Soulseek helper is already running on this computer. "
+                "Trackfetch will use it and will leave it running, because it did "
+                "not start it."
+            )
 
     helper_user = str(settings.config.get("username") or "slskd")
     helper_password = app.secrets.get(SecretStore.key_for("slskd", "password"))
@@ -152,7 +168,9 @@ def ensure_soulseek_ready(
         )
 
     say("Checking the Soulseek connection")
-    status = provider.test_connection()
+    # The user is sitting in front of the setup box waiting, so this one check is
+    # allowed to nudge slskd into connecting.
+    status = provider.check_connection(interactive=True)
 
     if status.state is not ConnectionState.CONNECTED and already_running:
         say("A helper is already running but Trackfetch could not sign in to it")

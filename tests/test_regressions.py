@@ -485,3 +485,433 @@ def test_the_same_holds_for_syncthing(settings, secrets, tmp_path):
     assert job.status is TransferStatus.COMPLETE
     assert (target_dir / "CHANGELOG").is_file()
     provider.close()
+
+
+# ---------------------------------------------------------------------------
+# The Soulseek helper must be stopped on exit
+#
+# This is the one that cost an afternoon. Trackfetch started slskd and never
+# stopped it, so after Trackfetch was closed the helper kept running, kept hold
+# of the Soulseek account, and knocked the user's ordinary Soulseek program off
+# within a second of it signing in.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProcess:
+    def __init__(self, pid=4242):
+        self.pid = pid
+        self.terminated = False
+        self._alive = True
+
+    def poll(self):
+        return None if self._alive else 0
+
+    def terminate(self):
+        self.terminated = True
+        self._alive = False
+
+    def wait(self, timeout=None):
+        self._alive = False
+        return 0
+
+
+def _supervisor(tmp_path):
+    from trackfetch.services.slskd_supervisor import SlskdSupervisor
+
+    return SlskdSupervisor(managed_dir=tmp_path / "slskd")
+
+
+def test_stop_terminates_a_helper_trackfetch_started(tmp_path):
+    supervisor = _supervisor(tmp_path)
+    process = _FakeProcess()
+    supervisor._process = process
+
+    assert supervisor.stop() is True
+    assert process.terminated is True
+
+
+def test_stop_leaves_alone_a_helper_the_user_started(tmp_path):
+    """An slskd the user runs themselves is never touched. That was promised."""
+    supervisor = _supervisor(tmp_path)
+    supervisor.adopted_existing = True
+    process = _FakeProcess()
+    supervisor._process = process
+
+    assert supervisor.stop() is False
+    assert process.terminated is False
+
+
+def test_start_records_the_pid_so_a_later_run_can_stop_it(tmp_path, monkeypatch):
+    from trackfetch.services import slskd_supervisor as sup
+    from trackfetch.services.slskd_supervisor import SlskdInstallation
+
+    supervisor = _supervisor(tmp_path)
+    executable = tmp_path / "bin" / "slskd"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(supervisor, "is_running", lambda base_url=None: False)
+    monkeypatch.setattr(sup.subprocess, "Popen", lambda *a, **k: _FakeProcess(pid=777))
+
+    assert supervisor.start(SlskdInstallation(executable, "managed")) is True
+    assert supervisor.pid_file.exists()
+
+    # A brand new supervisor, as a later run of Trackfetch would have, still
+    # knows which process to stop.
+    fresh = _supervisor(tmp_path)
+    monkeypatch.setattr(sup, "_pid_is_slskd", lambda pid: pid == 777)
+    assert fresh._recorded_pid() == 777
+    assert fresh.started_by_trackfetch is True
+
+    stopped = {}
+    monkeypatch.setattr(sup, "_terminate_pid", lambda pid, timeout=10.0: stopped.setdefault(pid, True))
+    assert fresh.stop() is True
+    assert stopped == {777: True}
+    assert not fresh.pid_file.exists()
+
+
+def test_a_recycled_pid_is_never_signalled(tmp_path, monkeypatch):
+    """If the recorded number now belongs to something else, leave it alone."""
+    from trackfetch.services import slskd_supervisor as sup
+
+    supervisor = _supervisor(tmp_path)
+    supervisor._record_pid(31337, tmp_path / "slskd")
+    monkeypatch.setattr(sup, "_pid_is_slskd", lambda pid: False)
+
+    killed = []
+    monkeypatch.setattr(sup, "_terminate_pid", lambda pid, timeout=10.0: killed.append(pid))
+    assert supervisor.stop() is False
+    assert killed == []
+
+
+def test_shutdown_stops_the_helper(tmp_path, settings, secrets):
+    """The app's own shutdown path must reach the supervisor."""
+    from trackfetch.app import TrackfetchApp
+    from trackfetch.config.settings import SettingsStore
+    from trackfetch.storage.db import Database
+
+    class _Store(SettingsStore):
+        def __init__(self):
+            pass
+
+        def load(self):
+            return settings
+
+        def save(self, value):
+            return None
+
+    app = TrackfetchApp(
+        settings_store=_Store(),
+        secrets=secrets,
+        database=Database(tmp_path / "app.sqlite3"),
+        configure_logging=False,
+    )
+    provider = app.registry.get("slskd")
+    assert provider is not None
+    supervisor = _supervisor(tmp_path)
+    process = _FakeProcess()
+    supervisor._process = process
+    provider._supervisor = supervisor
+
+    assert app.soulseek_helper_stoppable() is True
+    app.shutdown()
+    assert process.terminated is True
+
+
+def test_shutdown_does_not_build_a_provider_just_to_ask(tmp_path, settings, secrets):
+    """Creating providers during shutdown would be the wrong thing to do."""
+    from trackfetch.app import TrackfetchApp
+    from trackfetch.config.settings import SettingsStore
+    from trackfetch.storage.db import Database
+
+    class _Store(SettingsStore):
+        def __init__(self):
+            pass
+
+        def load(self):
+            return settings
+
+        def save(self, value):
+            return None
+
+    app = TrackfetchApp(
+        settings_store=_Store(),
+        secrets=secrets,
+        database=Database(tmp_path / "app.sqlite3"),
+        configure_logging=False,
+    )
+    assert app.registry.existing("slskd") is None
+    assert app.soulseek_helper_stoppable() is False
+    assert app.registry.existing("slskd") is None
+    app.shutdown()
+
+
+def test_the_written_config_is_patient_about_timeouts(tmp_path):
+    """Short timeouts were showing up in slskd's log as disconnections."""
+    from trackfetch.services.slskd_supervisor import (
+        CONNECT_TIMEOUT_MS,
+        INACTIVITY_TIMEOUT_MS,
+    )
+
+    supervisor = _supervisor(tmp_path)
+    path = supervisor.write_config(
+        soulseek_username="tobias",
+        soulseek_password="secret",
+        web_username="slskd",
+        web_password="helper",
+        downloads_dir=tmp_path / "downloads",
+    )
+    text = path.read_text(encoding="utf-8")
+    assert f"connect: {CONNECT_TIMEOUT_MS}" in text
+    assert f"inactivity: {INACTIVITY_TIMEOUT_MS}" in text
+    assert CONNECT_TIMEOUT_MS >= 10000
+    # The password is in the file, but never in a log or a diagnostic report.
+    assert "secret" in text
+
+
+# ---------------------------------------------------------------------------
+# A background status check must look, not nudge
+#
+# The 60 second status timer was calling PUT /server every single time, which
+# cancelled slskd's own patient reconnection schedule and forced a fresh login
+# attempt once a minute for hours.
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_background_status_check_never_asks_slskd_to_reconnect(slskd):
+    _login()
+    respx.get(f"{API}/server").mock(
+        return_value=httpx.Response(200, json=fx.SERVER_STATE_DISCONNECTED)
+    )
+    reconnects = respx.put(f"{API}/server").mock(return_value=httpx.Response(204))
+
+    slskd.test_connection()
+    assert reconnects.call_count == 0
+
+
+@respx.mock
+def test_pressing_the_button_is_allowed_to_nudge(slskd):
+    _login()
+    respx.get(f"{API}/server").mock(
+        return_value=httpx.Response(200, json=fx.SERVER_STATE_DISCONNECTED)
+    )
+    reconnects = respx.put(f"{API}/server").mock(return_value=httpx.Response(204))
+
+    slskd.check_connection(interactive=True)
+    assert reconnects.call_count == 1
+
+
+def test_every_provider_has_the_read_only_check():
+    """check_connection must exist everywhere, so the timer is always safe."""
+    from trackfetch.providers.registry import PROVIDER_MODULES
+
+    assert PROVIDER_MODULES
+    from trackfetch.providers.base import Provider as Base
+
+    assert hasattr(Base, "check_connection")
+
+
+# ---------------------------------------------------------------------------
+# A lost connection must stop the batch, not burn through it
+#
+# 92 items were marked failed in about 30 seconds against a dead connection,
+# which lost the user's place in the list for no gain.
+# ---------------------------------------------------------------------------
+
+
+class _DeadProvider(Provider):
+    info = ProviderInfo(
+        provider_id="dead",
+        display_name="Dead service",
+        capabilities=frozenset({Capability.SEARCH}),
+    )
+
+    def __init__(self, ctx, fail_after=0):
+        super().__init__(ctx)
+        self.calls = 0
+        self.fail_after = fail_after
+
+    def test_connection(self):
+        return self._status_ok()
+
+    def search(self, text, options=None, cancel=None):
+        from trackfetch.providers.errors import SoulseekNotConnected
+
+        self.calls += 1
+        if self.calls > self.fail_after:
+            raise SoulseekNotConnected(provider_id="dead")
+        return []
+
+
+def _search_service(repos, settings, provider):
+    from trackfetch.services.search_service import SearchService
+
+    class _Registry:
+        def get(self, provider_id):
+            return provider
+
+    return SearchService(_Registry(), repos, settings)
+
+
+def _query_items(count, repos=None):
+    from trackfetch.models.common import BatchItem, InputKind
+
+    items = [BatchItem(raw_text=f"item {n}", kind=InputKind.QUERY) for n in range(count)]
+    if repos is not None:
+        # The searches are recorded against their batch item, so the items have
+        # to exist in the database exactly as they do in real use.
+        batch_id = repos.batches.create_batch(source="test")
+        repos.batches.add_items(batch_id, items)
+    return items
+
+
+def test_a_dropped_connection_halts_the_batch(repos, settings, slskd_ctx):
+    settings.search_concurrency = 1
+    provider = _DeadProvider(slskd_ctx)
+    service = _search_service(repos, settings, provider)
+
+    outcomes = service.search_all(_query_items(50, repos), "dead")
+
+    assert service.halted_reason
+    assert service.halted_remedy
+    # It stops shortly after the failures start, instead of chewing through all
+    # fifty and reporting every one as failed.
+    assert len(outcomes) < 10
+    assert provider.calls < 10
+
+
+def test_one_timeout_on_a_healthy_connection_does_not_halt(repos, settings, slskd_ctx):
+    """A single failure is normal. Only a run of them means the service is gone."""
+    from trackfetch.providers.errors import OperationTimedOut
+
+    class _Flaky(_DeadProvider):
+        def search(self, text, options=None, cancel=None):
+            self.calls += 1
+            if self.calls == 2:
+                raise OperationTimedOut(provider_id="dead")
+            return []
+
+    settings.search_concurrency = 1
+    provider = _Flaky(slskd_ctx)
+    service = _search_service(repos, settings, provider)
+
+    outcomes = service.search_all(_query_items(6, repos), "dead")
+
+    assert service.halted_reason == ""
+    assert len(outcomes) == 6
+
+
+def test_halting_is_reported_on_the_progress(repos, settings, slskd_ctx):
+    settings.search_concurrency = 1
+    provider = _DeadProvider(slskd_ctx)
+    service = _search_service(repos, settings, provider)
+
+    seen = []
+    service.search_all(_query_items(20, repos), "dead", on_progress=seen.append)
+
+    assert seen
+    assert seen[-1].halted
+    assert "Stopped after" in seen[-1].text
+
+
+def test_the_gap_between_searches_is_honoured(repos, settings, slskd_ctx):
+    """Firing a hundred searches off with no gap is what gets you dropped."""
+    settings.search_concurrency = 1
+    settings.search_gap_seconds = 0.2
+    provider = _DeadProvider(slskd_ctx, fail_after=99)
+    service = _search_service(repos, settings, provider)
+
+    started = time.monotonic()
+    service.search_all(_query_items(4, repos), "dead")
+    elapsed = time.monotonic() - started
+
+    # Three gaps between four searches, allowing plenty of slack.
+    assert elapsed >= 0.45
+
+
+def test_a_gap_of_zero_means_no_waiting(repos, settings, slskd_ctx):
+    settings.search_concurrency = 1
+    settings.search_gap_seconds = 0.0
+    provider = _DeadProvider(slskd_ctx, fail_after=99)
+    service = _search_service(repos, settings, provider)
+
+    started = time.monotonic()
+    service.search_all(_query_items(5, repos), "dead")
+    assert time.monotonic() - started < 1.0
+
+
+def test_the_gap_setting_survives_being_saved_and_loaded():
+    from trackfetch.config.settings import Settings
+
+    settings = Settings()
+    settings.search_gap_seconds = 3.5
+    assert Settings.from_dict(settings.to_dict()).search_gap_seconds == 3.5
+    # Nonsense is replaced by the default rather than crashing.
+    assert Settings.from_dict({"search_gap_seconds": "soon"}).search_gap_seconds == 2.0
+    assert Settings.from_dict({"search_gap_seconds": -5}).search_gap_seconds == 0.0
+
+
+# ---------------------------------------------------------------------------
+# The Connections strip must not delete the chip under the mouse pointer
+#
+# set_providers() rebuilt every chip on each 60 second refresh, and a click
+# landing on a chip Qt had already deleted took the whole program down with
+# "Internal C++ object (ConnectionChip) already deleted".
+# ---------------------------------------------------------------------------
+
+
+def test_the_connection_chips_are_not_rebuilt_on_every_refresh(qt_app):
+    from trackfetch.gui.widgets.connections_panel import ConnectionsPanel
+
+    panel = ConnectionsPanel()
+    providers = [("slskd", "Soulseek"), ("http", "Web download")]
+    panel.set_providers(providers)
+    first = panel._chips["slskd"]
+
+    panel.set_providers(list(providers))
+    assert panel._chips["slskd"] is first
+
+    panel.set_providers([("slskd", "Soulseek")])
+    assert "http" not in panel._chips
+
+
+def test_a_click_on_a_chip_being_deleted_does_not_crash(qt_app):
+    from PySide6.QtCore import QEvent, QPoint, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    from trackfetch.gui.widgets.connections_panel import ConnectionChip
+
+    chip = ConnectionChip("slskd", "Soulseek")
+
+    def explode(_event):
+        raise RuntimeError("Internal C++ object (ConnectionChip) already deleted.")
+
+    chip.clicked.connect(lambda _pid: explode(None))
+    event = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        QPoint(1, 1),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    # Must not raise.
+    chip.mouseReleaseEvent(event)
+
+
+def test_a_status_for_a_chip_that_has_gone_is_survived(qt_app):
+    from trackfetch.gui.widgets.connections_panel import ConnectionsPanel
+    from trackfetch.models.common import ConnectionState, ConnectionStatus
+
+    panel = ConnectionsPanel()
+    panel.set_providers([("slskd", "Soulseek")])
+
+    class _Gone:
+        def set_status(self, status):
+            raise RuntimeError("already deleted")
+
+    panel._chips["slskd"] = _Gone()
+    panel.set_status(
+        "slskd", ConnectionStatus(provider_id="slskd", state=ConnectionState.CONNECTED)
+    )
+    assert "slskd" not in panel._chips

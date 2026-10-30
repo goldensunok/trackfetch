@@ -16,10 +16,12 @@ themselves; if one is already running it is used as-is.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import platform
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -38,6 +40,13 @@ log = logging.getLogger(__name__)
 GITHUB_LATEST = "https://api.github.com/repos/slskd/slskd/releases/latest"
 RELEASE_PAGE = "https://github.com/slskd/slskd/releases/latest"
 DEFAULT_PORT = 5030
+
+#: slskd's own defaults are 10s connect and 15s inactivity, but the logs from a
+#: real home connection are full of "the wait timed out after 5000 milliseconds".
+#: These are deliberately generous. Being patient costs nothing; giving up early
+#: costs a reconnection.
+CONNECT_TIMEOUT_MS = 30000
+INACTIVITY_TIMEOUT_MS = 60000
 
 #: Process names of the ordinary Soulseek desktop client, used only to warn the
 #: user about the single-login rule. Trackfetch never stops or alters them.
@@ -98,6 +107,9 @@ class SlskdSupervisor:
         self.managed_dir = managed_dir or app_paths().slskd_dir
         self.port = port
         self._process: subprocess.Popen[bytes] | None = None
+        #: True when start() found slskd already answering and used it as-is,
+        #: rather than launching one. Trackfetch must not stop that one.
+        self.adopted_existing = False
         self._client_factory = http_client_factory or (
             lambda: httpx.Client(timeout=httpx.Timeout(10.0, connect=3.0))
         )
@@ -235,6 +247,13 @@ soulseek:
   username: {_yaml_str(soulseek_username)}
   password: {_yaml_str(soulseek_password)}
   description: "Trackfetch"
+  connection:
+    timeout:
+      # More patient than the defaults. Home connections and busy Soulseek
+      # servers routinely take longer than 5 seconds to answer, and a timeout
+      # there is what shows up as a disconnection.
+      connect: {int(CONNECT_TIMEOUT_MS)}
+      inactivity: {int(INACTIVITY_TIMEOUT_MS)}
 directories:
   downloads: {_yaml_str(str(downloads_dir))}
   incomplete: {_yaml_str(str(incomplete))}
@@ -278,6 +297,12 @@ flags:
         if not install.found or install.executable is None:
             return False
         if self.is_running():
+            # Something is already answering. It might be an slskd Trackfetch
+            # started on a previous run and failed to stop, or one the user runs
+            # themselves. Either way we use it rather than starting a second.
+            if self._recorded_pid() is None:
+                self.adopted_existing = True
+                log.info("slskd was already running; using it instead of starting one")
             return True
 
         command = [str(install.executable)]
@@ -311,28 +336,105 @@ flags:
         except OSError as exc:
             log.error("Could not start slskd: %s", exc)
             return False
-        log.info("Started slskd from %s", install.executable)
+        self.adopted_existing = False
+        self._record_pid(self._process.pid, install.executable)
+        log.info("Started slskd from %s (pid %s)", install.executable, self._process.pid)
         return True
 
-    def stop(self, timeout: float = 10.0) -> None:
-        """Stop only a process Trackfetch started itself."""
-        process = self._process
-        if process is None or process.poll() is not None:
-            self._process = None
-            return
+    # -- remembering the process across runs -------------------------------
+
+    @property
+    def pid_file(self) -> Path:
+        """Where Trackfetch notes down the helper it started.
+
+        Without this, closing Trackfetch and opening it again loses track of the
+        slskd it launched, which then stays running for ever and keeps hold of
+        the Soulseek account.
+        """
+        return self.managed_dir / "helper.pid"
+
+    def _record_pid(self, pid: int, executable: Path) -> None:
         try:
-            process.terminate()
-            process.wait(timeout=timeout)
-        except Exception:  # pragma: no cover - defensive
+            self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pid_file.write_text(
+                json.dumps({"pid": int(pid), "executable": str(executable), "at": time.time()}),
+                encoding="utf-8",
+            )
+        except OSError as exc:  # pragma: no cover - defensive
+            log.warning("Could not note down the helper's process id: %s", exc)
+
+    def _forget_pid(self) -> None:
+        try:
+            self.pid_file.unlink()
+        except OSError:
+            pass
+
+    def _recorded_pid(self) -> int | None:
+        """The pid Trackfetch last started, if that process is still slskd."""
+        try:
+            raw = json.loads(self.pid_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        pid = raw.get("pid") if isinstance(raw, dict) else None
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+        if not _pid_is_slskd(pid):
+            # The process is gone, or the number has been handed to something
+            # else entirely. Never signal a pid we cannot identify.
+            self._forget_pid()
+            return None
+        return pid
+
+    def stop(self, timeout: float = 10.0) -> bool:
+        """Stop the helper, but only one Trackfetch started itself.
+
+        Works both for a process started in this run and for one left behind by
+        an earlier run, which is the case that was leaving slskd holding the
+        Soulseek account after Trackfetch had closed. An slskd that was already
+        running when Trackfetch opened is never touched.
+        """
+        if self.adopted_existing:
+            log.info("Leaving slskd running: Trackfetch did not start it")
+            return False
+
+        stopped = False
+        process = self._process
+        if process is not None and process.poll() is None:
             try:
-                process.kill()
-            except Exception:
-                pass
+                process.terminate()
+                process.wait(timeout=timeout)
+                stopped = True
+            except Exception:  # pragma: no cover - defensive
+                try:
+                    process.kill()
+                    stopped = True
+                except Exception:
+                    pass
         self._process = None
+
+        if not stopped:
+            pid = self._recorded_pid()
+            if pid is not None:
+                stopped = _terminate_pid(pid, timeout=timeout)
+                if stopped:
+                    log.info("Stopped a Soulseek helper left over from an earlier run (pid %s)", pid)
+
+        self._forget_pid()
+        if stopped:
+            log.info("Soulseek helper stopped")
+        return stopped
 
     @property
     def started_by_trackfetch(self) -> bool:
-        return self._process is not None and self._process.poll() is None
+        if self.adopted_existing:
+            return False
+        if self._process is not None and self._process.poll() is None:
+            return True
+        return self._recorded_pid() is not None
+
+    def stoppable(self) -> bool:
+        """Whether there is a helper Trackfetch is allowed to stop."""
+        return self.started_by_trackfetch
 
     # -- installing --------------------------------------------------------
 
@@ -473,7 +575,57 @@ flags:
             "port": self.port,
             "running": self.is_running(),
             "started_by_trackfetch": self.started_by_trackfetch,
+            "adopted_existing": self.adopted_existing,
         }
+
+
+def _pid_is_slskd(pid: int) -> bool:
+    """Whether ``pid`` is alive and really is slskd.
+
+    Process ids get reused, so Trackfetch checks the name before signalling
+    anything. If the answer cannot be established, the answer is no.
+    """
+    try:
+        if _is_windows():  # pragma: no cover - Windows only
+            output = subprocess.run(  # noqa: S603
+                ["tasklist", "/FI", f"PID eq {int(pid)}", "/NH", "/FO", "CSV"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                creationflags=0x08000000,
+            ).stdout
+        else:
+            output = subprocess.run(  # noqa: S603
+                ["ps", "-p", str(int(pid)), "-o", "comm="],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            ).stdout
+    except Exception:
+        return False
+    return "slskd" in output.lower()
+
+
+def _terminate_pid(pid: int, timeout: float = 10.0) -> bool:
+    """Ask a process to close, then insist. Returns True if it is gone."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError) as exc:
+        log.warning("Could not stop the Soulseek helper (pid %s): %s", pid, exc)
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pid_is_slskd(pid):
+            return True
+        time.sleep(0.3)
+
+    try:  # pragma: no cover - only when SIGTERM is ignored
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except (OSError, ValueError):
+        pass
+    time.sleep(0.5)
+    return not _pid_is_slskd(pid)
 
 
 def _yaml_str(value: str) -> str:

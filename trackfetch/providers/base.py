@@ -144,7 +144,21 @@ class Provider(ABC):
 
     @abstractmethod
     def test_connection(self) -> ConnectionStatus:
-        """Check the service and return a status a person can read."""
+        """Check the service and return a status a person can read.
+
+        This must be safe to call repeatedly in the background: it reports what
+        it finds and does not try to repair anything.
+        """
+
+    def check_connection(self, interactive: bool = False) -> ConnectionStatus:
+        """Check the service, optionally allowing it to be nudged.
+
+        ``interactive`` is True only when the user has just pressed a button and
+        is waiting for an answer. A provider may then take a repairing action,
+        such as asking the service to reconnect. The automatic status refresh
+        always passes False, so nothing is ever nudged behind the user's back.
+        """
+        return self.test_connection()
 
     @property
     def last_status(self) -> ConnectionStatus:

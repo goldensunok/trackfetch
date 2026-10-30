@@ -158,8 +158,21 @@ def test_provider_tries_to_start_slskd_when_it_is_not_answering(slskd_ctx):
     supervisor = FakeSupervisor()
     p = SlskdProvider(slskd_ctx, supervisor=supervisor)
     respx.get(f"{API}/session/enabled").mock(side_effect=httpx.ConnectError("refused"))
-    p.test_connection()
+    p.check_connection(interactive=True)
     assert supervisor.start_calls == 1
+    p.close()
+
+
+@respx.mock
+def test_background_check_does_not_start_slskd(slskd_ctx):
+    """The automatic refresh looks and reports. It does not launch anything."""
+    slskd_ctx.provider_settings.config["manage_slskd"] = True
+    supervisor = FakeSupervisor()
+    p = SlskdProvider(slskd_ctx, supervisor=supervisor)
+    respx.get(f"{API}/session/enabled").mock(side_effect=httpx.ConnectError("refused"))
+    status = p.test_connection()
+    assert supervisor.start_calls == 0
+    assert status.state is ConnectionState.DISCONNECTED
     p.close()
 
 

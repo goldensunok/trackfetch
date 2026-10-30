@@ -67,9 +67,48 @@ class TrackfetchApp:
         try:
             self.transfers.stop()
         finally:
+            self.stop_soulseek_helper()
             self.registry.close()
             self.repos.close()
         self._started = False
+
+    def soulseek_helper_stoppable(self) -> bool:
+        """Whether there is a Soulseek helper that Trackfetch may stop."""
+        supervisor = self._soulseek_supervisor()
+        if supervisor is None:
+            return False
+        try:
+            return bool(supervisor.stoppable())
+        except Exception:  # pragma: no cover - defensive
+            return False
+
+    def stop_soulseek_helper(self) -> bool:
+        """Stop the slskd helper, if Trackfetch is the one that started it.
+
+        This matters more than it looks. Soulseek allows one login per account,
+        so a helper left running after Trackfetch closes keeps hold of the
+        account and knocks the user's ordinary Soulseek program straight back
+        off. A helper the user runs themselves is never touched.
+        """
+        supervisor = self._soulseek_supervisor()
+        if supervisor is None:
+            return False
+        try:
+            return bool(supervisor.stop())
+        except Exception:  # pragma: no cover - shutdown must never raise
+            log.debug("could not stop the Soulseek helper", exc_info=True)
+            return False
+
+    def _soulseek_supervisor(self):
+        """The slskd supervisor, without creating a provider that does not exist."""
+        getter = getattr(self.registry, "existing", None)
+        provider = getter("slskd") if callable(getter) else None
+        if provider is None:
+            return None
+        try:
+            return provider.supervisor
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     # -- settings ----------------------------------------------------------
 
