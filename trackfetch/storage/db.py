@@ -25,6 +25,19 @@ log = logging.getLogger(__name__)
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 BUSY_TIMEOUT_MS = 15000
 
+#: How long close() waits for work already in progress on other threads before
+#: giving up and leaving those connections open.
+CLOSE_GRACE_SECONDS = 5.0
+
+
+class DatabaseClosed(RuntimeError):
+    """Raised when something tries to use the database after it was closed.
+
+    A clean exception on a background thread. The alternative, which this
+    replaces, was sqlite closing a connection out from under a thread that was
+    still using it, and that ends the whole process with a segmentation fault.
+    """
+
 
 class Database:
     """A small, deliberately boring wrapper around ``sqlite3``."""
@@ -35,6 +48,11 @@ class Database:
         self._write_lock = threading.RLock()
         self._all_connections: list[sqlite3.Connection] = []
         self._connections_lock = threading.Lock()
+        #: Counts operations in flight on any thread, so close() can wait for
+        #: them instead of pulling the connection out from underneath.
+        self._gate = threading.Condition()
+        self._in_flight = 0
+        self._closed = False
         if self._path != ":memory:":
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._shared_memory_conn: sqlite3.Connection | None = None
@@ -99,7 +117,61 @@ class Database:
                 "INSERT OR REPLACE INTO schema_info(key, value) VALUES('version', '1')"
             )
 
-    def close(self) -> None:
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @contextmanager
+    def _in_use(self) -> Iterator[None]:
+        """Mark one database operation as in progress.
+
+        Closing waits for these to finish. Without it, a download finishing on
+        a background thread at the same moment as shutdown would have its
+        connection closed mid-statement, which takes the whole program down
+        with a segmentation fault and no message at all.
+        """
+        with self._gate:
+            if self._closed:
+                raise DatabaseClosed("The database has been closed.")
+            self._in_flight += 1
+        try:
+            yield
+        finally:
+            with self._gate:
+                self._in_flight -= 1
+                if self._in_flight <= 0:
+                    self._gate.notify_all()
+
+    def close(self, grace: float = CLOSE_GRACE_SECONDS) -> None:
+        """Stop accepting work, let what is running finish, then close.
+
+        If something is still running after the grace period the connections are
+        left open rather than closed underneath it. Leaking a handle at shutdown
+        is harmless; crashing is not.
+        """
+        deadline = None
+        with self._gate:
+            already = self._closed
+            self._closed = True
+            if self._in_flight > 0:
+                import time as _time
+
+                deadline = _time.monotonic() + max(0.0, grace)
+                while self._in_flight > 0:
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._gate.wait(remaining)
+            busy = self._in_flight
+        if already:
+            return
+        if busy > 0:
+            log.warning(
+                "Closing the database with %s operation(s) still running; "
+                "leaving their connections open",
+                busy,
+            )
+            return
         with self._connections_lock:
             for conn in self._all_connections:
                 try:
@@ -119,27 +191,29 @@ class Database:
         Nesting is allowed: an inner ``write()`` joins the transaction the outer
         one already opened rather than trying to begin a second.
         """
-        conn = self.connection
-        with self._write_lock:
-            depth = getattr(self._local, "depth", 0)
-            if depth == 0:
-                conn.execute("BEGIN IMMEDIATE")
-            self._local.depth = depth + 1
-            try:
-                yield conn
-            except Exception:
-                self._local.depth = depth
-                if depth == 0 and conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise
-            else:
-                self._local.depth = depth
-                if depth == 0 and conn.in_transaction:
-                    conn.execute("COMMIT")
+        with self._in_use():
+            conn = self.connection
+            with self._write_lock:
+                depth = getattr(self._local, "depth", 0)
+                if depth == 0:
+                    conn.execute("BEGIN IMMEDIATE")
+                self._local.depth = depth + 1
+                try:
+                    yield conn
+                except Exception:
+                    self._local.depth = depth
+                    if depth == 0 and conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+                else:
+                    self._local.depth = depth
+                    if depth == 0 and conn.in_transaction:
+                        conn.execute("COMMIT")
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
-        yield self.connection
+        with self._in_use():
+            yield self.connection
 
     # -- convenience -------------------------------------------------------
 
@@ -154,10 +228,12 @@ class Database:
             conn.executemany(sql, rows)
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        return list(self.connection.execute(sql, params).fetchall())
+        with self._in_use():
+            return list(self.connection.execute(sql, params).fetchall())
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
-        return self.connection.execute(sql, params).fetchone()
+        with self._in_use():
+            return self.connection.execute(sql, params).fetchone()
 
     # -- key/value app state ----------------------------------------------
 

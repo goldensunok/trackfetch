@@ -915,3 +915,122 @@ def test_a_status_for_a_chip_that_has_gone_is_survived(qt_app):
         "slskd", ConnectionStatus(provider_id="slskd", state=ConnectionState.CONNECTED)
     )
     assert "slskd" not in panel._chips
+
+
+# ---------------------------------------------------------------------------
+# Closing the database must not pull the rug from under a working thread
+#
+# Found by the test suite segfaulting. close() closed every connection,
+# including one a transfer worker was in the middle of using, and sqlite takes
+# the whole process down when that happens. No message, no log line, nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_close_waits_for_work_already_running(tmp_path):
+    from trackfetch.storage.db import Database
+
+    db = Database(tmp_path / "busy.sqlite3")
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def slow_write():
+        with db.write() as conn:
+            conn.execute(
+                "INSERT INTO app_state(key, value) VALUES('k','v') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
+            entered.set()
+            release.wait(5)
+        finished.set()
+
+    worker = threading.Thread(target=slow_write)
+    worker.start()
+    assert entered.wait(5)
+
+    closer = threading.Thread(target=lambda: db.close(grace=5.0))
+    closer.start()
+    time.sleep(0.2)
+    # The close is still waiting, because the write has not finished.
+    assert not finished.is_set()
+
+    release.set()
+    worker.join(5)
+    closer.join(5)
+    assert finished.is_set()
+    assert db.closed
+
+
+def test_using_a_closed_database_raises_instead_of_crashing(tmp_path):
+    from trackfetch.storage.db import Database, DatabaseClosed
+
+    db = Database(tmp_path / "gone.sqlite3")
+    db.close()
+
+    with pytest.raises(DatabaseClosed):
+        db.set_state("k", "v")
+    with pytest.raises(DatabaseClosed):
+        db.get_state("k")
+    with pytest.raises(DatabaseClosed):
+        with db.write():
+            pass
+
+
+def test_hammering_the_database_while_it_closes(tmp_path):
+    """The shape of the original crash: many threads writing as close lands."""
+    from trackfetch.storage.db import Database, DatabaseClosed
+
+    db = Database(tmp_path / "race.sqlite3")
+    stop = threading.Event()
+    errors: list[Exception] = []
+
+    def hammer(n):
+        while not stop.is_set():
+            try:
+                db.set_state(f"k{n}", "v")
+            except DatabaseClosed:
+                return
+            except Exception as exc:  # anything else is a real failure
+                errors.append(exc)
+                return
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    time.sleep(0.2)
+    db.close(grace=5.0)
+    stop.set()
+    for t in threads:
+        t.join(5)
+
+    assert errors == []
+    assert db.closed
+
+
+def test_stopping_transfers_lets_workers_finish_first(repos, settings, slskd_ctx):
+    """stop() used to abandon running workers, then the database closed."""
+    from trackfetch.services.transfer_manager import TransferManager
+
+    class _Registry:
+        def get(self, provider_id):
+            return None
+
+        def require(self, provider_id):
+            raise LookupError(provider_id)
+
+    manager = TransferManager(_Registry(), repos, settings)
+    manager.start()
+    started = threading.Event()
+    done = threading.Event()
+
+    def slow():
+        started.set()
+        time.sleep(0.6)
+        done.set()
+
+    manager._pool.submit(slow)
+    assert started.wait(5)
+    manager.stop()
+    # stop() returns only once the worker has finished, so nothing is still
+    # writing when the database is closed a moment later.
+    assert done.is_set()

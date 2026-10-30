@@ -108,7 +108,18 @@ class TransferManager:
         pool = self._pool
         self._pool = None
         if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
+            # Give the workers a moment to notice the cancel and finish writing
+            # their last row. Anything still running after that is left to the
+            # database's own shutdown guard. Waiting without a limit would hang
+            # the program on a slow remote server.
+            closer = threading.Thread(
+                target=lambda: pool.shutdown(wait=True, cancel_futures=True),
+                name="tf-pool-close",
+                daemon=True,
+            )
+            closer.start()
+            if wait:
+                closer.join(timeout=5)
 
     # -- loading and adding ------------------------------------------------
 
@@ -460,12 +471,21 @@ class TransferManager:
                 )
             except Exception:  # pragma: no cover - defensive
                 log.debug("could not record completion", exc_info=True)
-            self.repos.events.add(f"Finished {job.label}", "info", job.provider_id)
+            self._note(f"Finished {job.label}", "info", job.provider_id)
         elif job.status is TransferStatus.FAILED:
-            self.repos.events.add(
-                f"Failed {job.label}: {job.error}", "error", job.provider_id
-            )
+            self._note(f"Failed {job.label}: {job.error}", "error", job.provider_id)
         self._save(job)
+
+    def _note(self, message: str, level: str, provider_id: str) -> None:
+        """Record an event, but never let the note-keeping break the work.
+
+        A worker can finish at the moment the program is closing, when the
+        database is already shutting down.
+        """
+        try:
+            self.repos.events.add(message, level, provider_id)
+        except Exception:  # pragma: no cover - diagnostics must not break work
+            log.debug("could not record an event", exc_info=True)
 
     def _save(self, job: TransferJob) -> None:
         with self._lock:
