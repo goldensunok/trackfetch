@@ -53,10 +53,17 @@ def qt_app():
     without one. Nothing is shown: QT_QPA_PLATFORM=offscreen keeps it headless.
     """
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    pytest.importorskip("PySide6.QtWidgets")
-    from PySide6.QtWidgets import QApplication
+    try:
+        from PySide6.QtWidgets import QApplication
 
-    application = QApplication.instance() or QApplication([])
+        application = QApplication.instance() or QApplication([])
+    except Exception as exc:
+        # A bare machine often has PySide6 installed but not the system
+        # libraries it loads at import time, which raises ImportError rather
+        # than ModuleNotFoundError and so slips past importorskip. Skipping is
+        # right here: these tests check interface behaviour, and a machine with
+        # no graphics stack cannot answer the question either way.
+        pytest.skip(f"Qt cannot start on this machine: {exc}")
     yield application
 
 
