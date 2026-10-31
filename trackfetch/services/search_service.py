@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Sequence
@@ -106,10 +107,12 @@ class SearchService:
         self._halted_reason = ""
         self._halted_remedy = ""
         self._consecutive_connection_failures = 0
-        #: Guards the pause between starting one search and the next, so the
-        #: gap applies across all the worker threads and not per thread.
+        #: Guards the pacing, so the limit applies across all the worker
+        #: threads rather than per thread.
         self._pace_lock = threading.Lock()
         self._last_search_started = 0.0
+        #: When each recent search was started, for the rolling rate limit.
+        self._recent_starts: deque[float] = deque()
 
     # -- control -----------------------------------------------------------
 
@@ -132,25 +135,41 @@ class SearchService:
     # -- pacing ------------------------------------------------------------
 
     def _wait_for_turn(self) -> None:
-        """Hold back a moment before starting the next search.
+        """Hold the next search back until the network will tolerate it.
 
-        Soulseek searches are broadcast across the whole network. Firing a
-        hundred of them off back to back is the fastest way to be dropped, so
-        Trackfetch leaves a gap. The gap is a setting, and the user can set it
-        to zero if they want the old behaviour.
+        The Soulseek server blocks an account for about half an hour if it
+        sends too many searches too quickly, and the block looks from the
+        outside like an ordinary disconnection, which makes it baffling. Two
+        limits keep Trackfetch the right side of it: a minimum gap between one
+        search and the next, and a ceiling on how many may start within a
+        rolling window. Both are settings, so a patient user can go slower and
+        an impatient one can take the risk knowingly.
         """
-        gap = max(0.0, float(getattr(self.settings, "search_gap_seconds", 0.0) or 0.0))
-        if gap <= 0:
-            return
-        while True:
+        while not self._cancel.is_set():
+            gap = max(0.0, float(getattr(self.settings, "search_gap_seconds", 0.0) or 0.0))
+            ceiling = max(0, int(getattr(self.settings, "search_rate_limit", 0) or 0))
+            window = max(
+                1.0, float(getattr(self.settings, "search_rate_window_seconds", 220.0) or 220.0)
+            )
+
             with self._pace_lock:
-                waited = time.monotonic() - self._last_search_started
-                if self._last_search_started == 0.0 or waited >= gap:
-                    self._last_search_started = time.monotonic()
+                now = time.monotonic()
+                while self._recent_starts and now - self._recent_starts[0] >= window:
+                    self._recent_starts.popleft()
+
+                wait_for = 0.0
+                if gap > 0 and self._last_search_started:
+                    wait_for = max(wait_for, gap - (now - self._last_search_started))
+                if ceiling and len(self._recent_starts) >= ceiling:
+                    wait_for = max(wait_for, window - (now - self._recent_starts[0]))
+
+                if wait_for <= 0:
+                    self._last_search_started = now
+                    self._recent_starts.append(now)
                     return
-                remaining = gap - waited
-            if self._cancel.wait(min(remaining, 0.25)):
-                return
+
+            # Wake often enough to notice a cancel, however long the wait.
+            self._cancel.wait(min(wait_for, 0.5))
 
     # -- the batch ---------------------------------------------------------
 
@@ -184,6 +203,7 @@ class SearchService:
         self._halted_remedy = ""
         self._consecutive_connection_failures = 0
         self._last_search_started = 0.0
+        self._recent_starts.clear()
         options = SearchOptions(
             timeout=self.settings.search_timeout,
             response_limit=self.settings.result_limit,
@@ -260,9 +280,12 @@ class SearchService:
                 self._halted_reason = (
                     f"Searching stopped because the connection was lost. {message}".strip()
                 )
-                self._halted_remedy = getattr(exc, "remedy", "") or (
-                    "Check the connection at the top of the window, then press "
-                    "SEARCH ALL again. Items already searched are kept."
+                self._halted_remedy = (
+                    "Soulseek blocks an account for around half an hour when it "
+                    "sees too many searches too quickly, and that looks exactly "
+                    "like this. Leave it a while, then press SEARCH ALL again: "
+                    "everything found so far is kept. If it keeps happening, "
+                    "lower the search settings under Settings, Search."
                 )
 
     def _note_success(self) -> None:

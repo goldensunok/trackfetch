@@ -707,12 +707,30 @@ class SettingsDialog(QDialog):
         self.search_gap.setValue(float(self.app.settings.search_gap_seconds))
         self.search_gap.valueChanged.connect(self._save_search)
         form.addRow("Pause between searches", self.search_gap)
+
+        self.search_rate_limit = QSpinBox()
+        self.search_rate_limit.setRange(0, 1000)
+        self.search_rate_limit.setValue(int(self.app.settings.search_rate_limit))
+        self.search_rate_limit.valueChanged.connect(self._save_search)
+        form.addRow("Most searches in a burst", self.search_rate_limit)
+
+        self.search_rate_window = QDoubleSpinBox()
+        self.search_rate_window.setRange(1.0, 3600.0)
+        self.search_rate_window.setDecimals(0)
+        self.search_rate_window.setSingleStep(10.0)
+        self.search_rate_window.setSuffix(" seconds")
+        self.search_rate_window.setValue(float(self.app.settings.search_rate_window_seconds))
+        self.search_rate_window.valueChanged.connect(self._save_search)
+        form.addRow("...measured over", self.search_rate_window)
         form.addRow(
             "",
             _hint(
-                "Soulseek sends every search out across the whole network. A short "
-                "pause makes a long list far less likely to get you disconnected. "
-                "Set it to 0 for no pause."
+                "Soulseek blocks an account for about half an hour if it sees too "
+                "many searches too quickly, and the block looks just like being "
+                "disconnected. These three settings keep you under that line. The "
+                "defaults, 34 searches every 220 seconds, are what established "
+                "Soulseek tools settle on. Raising them risks the block; 0 for the "
+                "burst limit switches the ceiling off entirely."
             ),
         )
 
@@ -852,6 +870,8 @@ class SettingsDialog(QDialog):
         self.app.settings.result_limit = self.result_limit.value()
         self.app.settings.minimum_response_file_count = self.min_files.value()
         self.app.settings.search_gap_seconds = float(self.search_gap.value())
+        self.app.settings.search_rate_limit = int(self.search_rate_limit.value())
+        self.app.settings.search_rate_window_seconds = float(self.search_rate_window.value())
         self.app.save_settings()
 
     def _save_filters(self, value: ResultFilter) -> None:

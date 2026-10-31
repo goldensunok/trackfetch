@@ -5,7 +5,7 @@
 ; no administrator prompt appears.
 
 #define AppName "Trackfetch"
-#define AppVersion "1.0.1"
+#define AppVersion "1.0.2"
 #define AppPublisher "Trackfetch"
 #define AppExeName "Trackfetch.exe"
 

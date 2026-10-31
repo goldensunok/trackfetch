@@ -1034,3 +1034,53 @@ def test_stopping_transfers_lets_workers_finish_first(repos, settings, slskd_ctx
     # stop() returns only once the worker has finished, so nothing is still
     # writing when the database is closed a moment later.
     assert done.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Every single Soulseek search came back empty
+#
+# slskd's documentation calls the search timeout a value in seconds. The
+# running code reads it as milliseconds (slskd issue 1820), so Trackfetch was
+# asking for a fifteen millisecond search: over before a single peer on the
+# network could answer. 149 real searches in one day, every one with zero
+# responses, and nothing in any log to say why.
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_the_search_timeout_is_sent_in_milliseconds(slskd):
+    import json as _json
+
+    _login()
+    route = respx.post(f"{API}/searches").mock(
+        return_value=httpx.Response(200, json=fx.SEARCH_STATE_IN_PROGRESS)
+    )
+    slskd.client.search_start("Aphex Twin Xtal", timeout_seconds=15)
+    body = _json.loads(route.calls[0].request.content)
+    assert body["searchTimeout"] == 15000
+    # A search measured in thousandths of a second is the bug, so guard the
+    # magnitude rather than only the arithmetic.
+    assert body["searchTimeout"] >= 1000
+
+
+@respx.mock
+def test_tabs_in_a_pasted_line_do_not_reach_the_network(slskd):
+    """Lists pasted from other programs arrive as title, tab, artist."""
+    import json as _json
+
+    _login()
+    route = respx.post(f"{API}/searches").mock(
+        return_value=httpx.Response(200, json=fx.SEARCH_STATE_IN_PROGRESS)
+    )
+    slskd.client.search_start("A Song for You\tDonny Hathaway")
+    body = _json.loads(route.calls[0].request.content)
+    assert body["searchText"] == "A Song for You Donny Hathaway"
+    assert "\t" not in body["searchText"]
+
+
+def test_search_text_tidying():
+    from trackfetch.providers.slskd_client import clean_search_text
+
+    assert clean_search_text("  Les Fleurs\tMinnie Riperton  ") == "Les Fleurs Minnie Riperton"
+    assert clean_search_text("two  spaces") == "two spaces"
+    assert clean_search_text("a\nb") == "a b"

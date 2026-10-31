@@ -57,6 +57,17 @@ log = logging.getLogger(__name__)
 API_VERSION = "v0"
 SERVICE_NAME = "the Soulseek helper (slskd)"
 
+
+def clean_search_text(text: str) -> str:
+    """Tidy a line into something sensible to send to the Soulseek network.
+
+    Lists pasted out of other programs arrive with tabs between the title and
+    the artist, and sometimes stray double spaces. Soulseek matches on words,
+    so collapsing all of that to single spaces costs nothing and avoids sending
+    control characters across the network.
+    """
+    return " ".join(str(text).split())
+
 #: Transfer state strings slskd reports, grouped by what they mean to a person.
 TERMINAL_SUCCESS = "Completed, Succeeded"
 TERMINAL_CANCELLED = "Completed, Cancelled"
@@ -320,8 +331,14 @@ class SlskdClient:
         """Start a real Soulseek search and return slskd's search state."""
         body: dict[str, Any] = {
             "id": search_id or str(uuid.uuid4()),
-            "searchText": text,
-            "searchTimeout": int(timeout_seconds),
+            "searchText": clean_search_text(text),
+            # slskd's documentation calls this a value in seconds. It is not:
+            # the running code treats it as milliseconds, so sending 15 ended
+            # every search 15 thousandths of a second after it began, which is
+            # why searches came back with nothing at all. See slskd issue 1820.
+            # Sending milliseconds is also safe if that is ever corrected: our
+            # own deadline below stops the wait and collects whatever arrived.
+            "searchTimeout": int(timeout_seconds * 1000),
             "responseLimit": int(response_limit),
             "fileLimit": int(file_limit),
             "filterResponses": bool(filter_responses),

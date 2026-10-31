@@ -190,7 +190,9 @@ def test_search_start_posts_the_documented_body(apikey_client):
     apikey_client.search_start("Aphex Twin - Xtal", timeout_seconds=20, response_limit=100)
     body = json.loads(route.calls[0].request.content)
     assert body["searchText"] == "Aphex Twin - Xtal"
-    assert body["searchTimeout"] == 20
+    # Milliseconds, not seconds, whatever the documentation says. See the note
+    # in search_start and the regression test that guards it.
+    assert body["searchTimeout"] == 20000
     assert body["responseLimit"] == 100
     assert "id" in body
     assert body["fileLimit"] == 10000

@@ -125,13 +125,21 @@ class Settings:
 
     # Search
     search_timeout: int = 15
-    search_concurrency: int = 4
+    #: Two at a time, not four. The Soulseek server counts searches, not
+    #: threads, and a smaller number here makes a long list far steadier.
+    search_concurrency: int = 2
     result_limit: int = 250
     minimum_response_file_count: int = 1
-    #: Seconds to leave between starting one search and the next. Soulseek
-    #: searches go out across the whole network, and sending them off with no
-    #: gap is a reliable way to be dropped. Zero means no gap at all.
+    #: Seconds to leave between starting one search and the next. Zero means
+    #: no gap at all.
     search_gap_seconds: float = 2.0
+    #: The Soulseek server blocks an account for around half an hour when it
+    #: sees too many searches too quickly, and the block looks exactly like an
+    #: ordinary disconnection. These two numbers keep Trackfetch under that
+    #: line: at most this many searches may start within the window below.
+    #: The defaults match what established bulk Soulseek tools settle on.
+    search_rate_limit: int = 34
+    search_rate_window_seconds: float = 220.0
 
     # Interface
     theme: str = "system"
@@ -174,6 +182,8 @@ class Settings:
                 "result_limit": self.result_limit,
                 "minimum_response_file_count": self.minimum_response_file_count,
                 "search_gap_seconds": self.search_gap_seconds,
+                "search_rate_limit": self.search_rate_limit,
+                "search_rate_window_seconds": self.search_rate_window_seconds,
                 "theme": self.theme,
                 "confirm_before_download": self.confirm_before_download,
                 "filters": asdict(self.filters),
@@ -198,6 +208,8 @@ class Settings:
             "result_limit",
             "minimum_response_file_count",
             "search_gap_seconds",
+            "search_rate_limit",
+            "search_rate_window_seconds",
             "theme",
             "confirm_before_download",
             "filters",
@@ -216,13 +228,17 @@ class Settings:
         except ValueError:
             settings.duplicate_policy = DuplicatePolicy.ASK
         settings.search_timeout = _clamp(data.get("search_timeout", 15), 5, 300, 15)
-        settings.search_concurrency = _clamp(data.get("search_concurrency", 4), 1, 16, 4)
+        settings.search_concurrency = _clamp(data.get("search_concurrency", 2), 1, 16, 2)
         settings.result_limit = _clamp(data.get("result_limit", 250), 1, 5000, 250)
         settings.minimum_response_file_count = _clamp(
             data.get("minimum_response_file_count", 1), 1, 1000, 1
         )
         settings.search_gap_seconds = _clamp_float(
             data.get("search_gap_seconds", 2.0), 0.0, 60.0, 2.0
+        )
+        settings.search_rate_limit = _clamp(data.get("search_rate_limit", 34), 0, 1000, 34)
+        settings.search_rate_window_seconds = _clamp_float(
+            data.get("search_rate_window_seconds", 220.0), 1.0, 3600.0, 220.0
         )
         settings.theme = str(data.get("theme", "system"))
         settings.confirm_before_download = bool(data.get("confirm_before_download", False))
