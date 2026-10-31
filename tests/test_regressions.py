@@ -1084,3 +1084,35 @@ def test_search_text_tidying():
     assert clean_search_text("  Les Fleurs\tMinnie Riperton  ") == "Les Fleurs Minnie Riperton"
     assert clean_search_text("two  spaces") == "two spaces"
     assert clean_search_text("a\nb") == "a b"
+
+
+# ---------------------------------------------------------------------------
+# Do not delete a search out from under slskd
+#
+# Trackfetch removed each search the instant it had the responses. slskd was
+# still writing that search's own record, and its log filled with "the database
+# operation was expected to affect 1 row(s), but actually affected 0 row(s)".
+# slskd clears old searches on its own schedule; ours is not to tidy.
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_a_finished_search_is_left_for_slskd_to_clear(slskd):
+    _login()
+    respx.post(f"{API}/searches").mock(
+        return_value=httpx.Response(200, json=fx.SEARCH_STATE_IN_PROGRESS)
+    )
+    respx.get(f"{API}/searches/{fx.SEARCH_ID}").mock(
+        return_value=httpx.Response(200, json=fx.SEARCH_STATE_COMPLETE)
+    )
+    respx.get(f"{API}/searches/{fx.SEARCH_ID}/responses").mock(
+        return_value=httpx.Response(200, json=fx.SEARCH_RESPONSES)
+    )
+    deletes = respx.delete(f"{API}/searches/{fx.SEARCH_ID}").mock(
+        return_value=httpx.Response(204)
+    )
+
+    state, responses = slskd.client.run_search("anything", timeout_seconds=1, poll_interval=0.01)
+
+    assert responses
+    assert deletes.call_count == 0

@@ -322,13 +322,12 @@ class SlskdProvider(Provider):
 
         self.ensure_available()
         size = coerce_int(job.payload.get("size")) or 0
-        destination = job.destination or str(self.ctx.download_dir())
 
         try:
             self.client.enqueue(
                 username,
                 [{"filename": remote_filename, "size": size}],
-                destination=destination or None,
+                destination=self._relative_destination(job),
             )
         except TrackfetchError as exc:
             job.status = TransferStatus.FAILED
@@ -351,6 +350,36 @@ class SlskdProvider(Provider):
         job.touch()
         self.ctx.event(f"Asked Soulseek for {job.label}", "info")
         return job
+
+    def _relative_destination(self, job: TransferJob) -> str | None:
+        """A subfolder for slskd, expressed the only way slskd will accept it.
+
+        slskd refuses an absolute path outright: its destination must be
+        relative to the download folder it was configured with, and must not
+        climb out of it. Sending a full Windows path meant every download came
+        back as "the Soulseek helper refused the request" with nothing to show
+        why. Where the job's folder sits inside slskd's own, the difference
+        between them is sent; where it does not, nothing is sent and the file
+        lands in slskd's folder, which is the one Trackfetch set up.
+        """
+        wanted = str(job.destination or "").strip()
+        if not wanted:
+            return None
+        try:
+            root = Path(str(self.ctx.download_dir())).expanduser().resolve()
+            target = Path(wanted).expanduser().resolve()
+        except (OSError, ValueError):  # pragma: no cover - odd paths
+            return None
+        if target == root:
+            return None
+        try:
+            relative = target.relative_to(root)
+        except ValueError:
+            # Somewhere else entirely. slskd cannot write there on our behalf,
+            # so let the file land in its own folder rather than failing.
+            return None
+        text = relative.as_posix().strip("/")
+        return text or None
 
     def poll(self, jobs: Sequence[TransferJob]) -> list[TransferJob]:
         """Refresh Soulseek transfers from slskd."""

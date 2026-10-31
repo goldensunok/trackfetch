@@ -229,3 +229,119 @@ def test_choosing_by_hand_then_downloading_the_lot(tmp_path, repos, settings, se
         assert all(j.status is TransferStatus.COMPLETE for j in jobs), [
             (j.label, str(j.status), j.error) for j in jobs
         ]
+
+
+# ---------------------------------------------------------------------------
+# The download destination
+#
+# slskd marks the batch destination [RelativePath] and [NonTraversingPath]:
+# relative to its own download folder, and never climbing out of it. Trackfetch
+# sent the full Windows path, so every download failed the moment it was asked
+# for, with "the Soulseek helper refused the request" and no reason given.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_downloads_are_not_asked_for_with_an_absolute_path(tmp_path, repos, settings, secrets):
+    with FakeSlskdServer(rate_limit=1000, rate_window=1.0) as server:
+        provider = _provider(server, settings, secrets)
+        settings.search_timeout = 1
+        settings.search_concurrency = 2
+        settings.search_gap_seconds = 0.0
+        settings.search_rate_limit = 0
+        settings.download_dir = str(tmp_path / "music")
+
+        service = SearchService(_Registry(provider), repos, settings)
+        outcomes = service.search_all(_items(repos, BATCH[:4]), "slskd")
+        assert all(o.candidates for o in outcomes)
+
+        # The folder Trackfetch hands the job is the one the user chose.
+        destination = tmp_path / "music"
+        destination.mkdir(parents=True, exist_ok=True)
+        jobs = [provider.submit(provider.build_job(o.candidates[0], destination))
+                for o in outcomes]
+        provider.close()
+
+        assert server.world.rejected_destinations == [], server.world.rejected_destinations
+        assert all(j.status is not TransferStatus.FAILED for j in jobs), [
+            j.error for j in jobs if j.status is TransferStatus.FAILED
+        ]
+        assert all(d is None or not str(d).startswith(("/", "\\"))
+                   for d in server.world.destinations_seen)
+
+
+@pytest.mark.slow
+def test_a_subfolder_inside_the_download_folder_is_sent_relative(
+    tmp_path, repos, settings, secrets
+):
+    with FakeSlskdServer(rate_limit=1000, rate_window=1.0) as server:
+        provider = _provider(server, settings, secrets)
+        settings.search_timeout = 1
+        settings.search_concurrency = 1
+        settings.search_gap_seconds = 0.0
+        settings.search_rate_limit = 0
+        settings.download_dir = str(tmp_path / "music")
+
+        service = SearchService(_Registry(provider), repos, settings)
+        outcomes = service.search_all(_items(repos, BATCH[:1]), "slskd")
+
+        inner = tmp_path / "music" / "soul night"
+        inner.mkdir(parents=True, exist_ok=True)
+        job = provider.submit(provider.build_job(outcomes[0].candidates[0], inner))
+        provider.close()
+
+        assert job.status is not TransferStatus.FAILED, job.error
+        assert server.world.destinations_seen == ["soul night"]
+        assert server.world.rejected_destinations == []
+
+
+# ---------------------------------------------------------------------------
+# slskd only takes two download requests at a time
+#
+# Its controller holds a semaphore of two and answers anything beyond that with
+# 429 immediately. Trackfetch starts three downloads at once by default, so the
+# third would fail for a reason no user could act on.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_downloads_started_together_all_get_through(tmp_path, repos, settings, secrets):
+    import threading
+
+    with FakeSlskdServer(rate_limit=1000, rate_window=1.0) as server:
+        provider = _provider(server, settings, secrets)
+        settings.search_timeout = 1
+        settings.search_concurrency = 2
+        settings.search_gap_seconds = 0.0
+        settings.search_rate_limit = 0
+
+        service = SearchService(_Registry(provider), repos, settings)
+        outcomes = service.search_all(_items(repos, BATCH[:8]), "slskd")
+        assert all(o.candidates for o in outcomes)
+
+        destination = tmp_path / "downloads"
+        destination.mkdir()
+        jobs = [provider.build_job(o.candidates[0], destination) for o in outcomes]
+
+        # Eight downloads started from several threads at the same moment, the
+        # way the queue does it.
+        done: list[object] = []
+        lock = threading.Lock()
+
+        def submit(job):
+            result = provider.submit(job)
+            with lock:
+                done.append(result)
+
+        threads = [threading.Thread(target=submit, args=(j,)) for j in jobs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        provider.close()
+
+        assert len(done) == 8
+        failed = [j for j in jobs if j.status is TransferStatus.FAILED]
+        assert not failed, [(j.label, j.error) for j in failed]
+        # The stand-in must actually have pushed back, or this proves nothing.
+        assert server.world.enqueue_429s > 0

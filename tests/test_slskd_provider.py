@@ -325,7 +325,10 @@ def test_only_the_selected_file_is_enqueued(provider, tmp_path):
     body = json.loads(route.calls[0].request.content)
     assert body["username"] == "peer_two"
     assert body["files"] == [{"filename": "C:\\shared\\aphex_twin-xtal.mp3", "size": 7340032}]
-    assert body["options"]["destination"] == str(tmp_path)
+    # No destination: the chosen folder is not inside slskd's own download
+    # folder, and slskd refuses anything but a relative path. The file lands in
+    # slskd's folder, which is the one Trackfetch set it up with.
+    assert "options" not in body
     assert job.status is TransferStatus.QUEUED
     assert len(route.calls) == 1
 

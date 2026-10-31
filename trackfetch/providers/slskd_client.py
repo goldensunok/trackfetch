@@ -57,6 +57,13 @@ log = logging.getLogger(__name__)
 API_VERSION = "v0"
 SERVICE_NAME = "the Soulseek helper (slskd)"
 
+#: slskd lets only two download requests run at once and refuses the next with
+#: 429 immediately, saying to wait for the previous one. Trackfetch can start
+#: three downloads together, so it waits and asks again rather than failing.
+ENQUEUE_RETRIES = 6
+ENQUEUE_RETRY_DELAY = 0.4
+ENQUEUE_RETRY_MAX_DELAY = 3.0
+
 
 def clean_search_text(text: str) -> str:
     """Tidy a line into something sensible to send to the Soulseek network.
@@ -392,7 +399,11 @@ class SlskdClient:
         minimum_peer_upload_speed: int | None = None,
         poll_interval: float = 1.0,
         cancel: threading.Event | None = None,
-        cleanup: bool = True,
+        # Tidying up after ourselves turned out to be rude. slskd is still
+        # writing the search's own record when the responses are collected, and
+        # deleting it underneath filled slskd's log with database errors. It
+        # removes old searches on its own schedule, so leave them be.
+        cleanup: bool = False,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """Run one search all the way through.
 
@@ -481,20 +492,15 @@ class SlskdClient:
         if self._batch_endpoint_supported is not False:
             body: dict[str, Any] = {"username": username, "files": payload_files}
             if destination:
+                # Relative to slskd's own download folder. It rejects anything
+                # else outright, so the caller must not pass a full path.
                 body["options"] = {"destination": destination}
             if search_id:
                 body["searchId"] = search_id
-            response = self._http.request(
-                "POST", "/transfers/downloads/batches", json=body, raise_for_status=False
-            )
+            response = self._send_enqueue("/transfers/downloads/batches", body)
             if response.status_code in (401, 403) and not self._api_key:
                 if self._login(force=True):
-                    response = self._http.request(
-                        "POST",
-                        "/transfers/downloads/batches",
-                        json=body,
-                        raise_for_status=False,
-                    )
+                    response = self._send_enqueue("/transfers/downloads/batches", body)
             if response.status_code < 400:
                 self._batch_endpoint_supported = True
                 return True
@@ -508,10 +514,32 @@ class SlskdClient:
             self._batch_endpoint_supported = False
             log.info("slskd batch download endpoint unavailable, using the older API")
 
-        self._request(
-            "POST", f"/transfers/downloads/{_quote(username)}", json=payload_files
+        legacy = self._send_enqueue(
+            f"/transfers/downloads/{_quote(username)}", payload_files
         )
+        if legacy.status_code >= 400:
+            from trackfetch.providers._http import translate_status
+
+            raise translate_status(legacy, SERVICE_NAME, "slskd")
         return True
+
+    def _send_enqueue(self, path: str, body: Any) -> httpx.Response:
+        """POST a download request, waiting out slskd's own queue of requests.
+
+        slskd allows only two enqueue requests to be in flight at once and
+        answers the next with 429 straight away, telling the caller to wait.
+        Trackfetch can easily have three downloads starting together, so
+        without this the third fails for no reason a person could act on.
+        """
+        delay = ENQUEUE_RETRY_DELAY
+        for attempt in range(ENQUEUE_RETRIES + 1):
+            response = self._http.request("POST", path, json=body, raise_for_status=False)
+            if response.status_code != 429 or attempt == ENQUEUE_RETRIES:
+                return response
+            log.debug("slskd is busy with another download request; waiting %.1fs", delay)
+            time.sleep(delay)
+            delay = min(delay * 2, ENQUEUE_RETRY_MAX_DELAY)
+        return response  # pragma: no cover - the loop always returns
 
     def downloads(self, include_removed: bool = False) -> list[dict[str, Any]]:
         """Every download slskd knows about, flattened into transfer records."""

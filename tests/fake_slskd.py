@@ -59,6 +59,16 @@ class FakeSoulseek:
         self.rejected_searches = 0
         #: Every searchTimeout value received, so a test can assert the units.
         self.timeouts_seen: list[int] = []
+        #: Destinations refused for not being a relative path.
+        self.rejected_destinations: list[str] = []
+        #: Destinations accepted, so a test can check what was actually sent.
+        self.destinations_seen: list[str | None] = []
+        #: slskd allows only two enqueue requests at once and answers the rest
+        #: with 429 straight away. Reproduced here, along with how long each
+        #: one takes, because that is what makes the third request collide.
+        self.enqueue_slots = threading.Semaphore(2)
+        self.enqueue_duration = 0.25
+        self.enqueue_429s = 0
 
     # -- the Soulseek server's temper --------------------------------------
 
@@ -202,9 +212,41 @@ class FakeSoulseek:
 
     # -- transfers ---------------------------------------------------------
 
-    def enqueue(self, username: str, files: list[dict[str, Any]]) -> tuple[int, Any]:
+    def enqueue(
+        self, username: str, files: list[dict[str, Any]], destination: str | None = None
+    ) -> tuple[int, Any]:
+        # slskd's own model marks the destination [RelativePath] and
+        # [NonTraversingPath]: an absolute path, or one that climbs out of the
+        # download folder, is rejected before anything is queued. Trackfetch
+        # used to send a full Windows path, and every download failed with
+        # nothing to explain it. Reproduce the rule, or the tests bless the bug.
+        if destination is not None:
+            text = str(destination)
+            if (
+                not text
+                or text.startswith(("/", "\\"))
+                or (len(text) > 1 and text[1] == ":")
+                or ".." in text.replace("\\", "/").split("/")
+            ):
+                with self.lock:
+                    self.rejected_destinations.append(text)
+                return 400, "The Destination field is not a valid relative path"
+
+        if not self.enqueue_slots.acquire(blocking=False):
+            with self.lock:
+                self.enqueue_429s += 1
+            return 429, (
+                "Only one concurrent operation is permitted. "
+                "Wait until the previous request completes"
+            )
+        try:
+            time.sleep(self.enqueue_duration)
+        finally:
+            self.enqueue_slots.release()
+
         now = time.monotonic()
         with self.lock:
+            self.destinations_seen.append(destination)
             for f in files:
                 tid = str(uuid.uuid4())
                 self.transfers[(username, tid)] = {
@@ -331,7 +373,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/v0/transfers/downloads/batches":
             username = str(body.get("username") or "")
             files = list(body.get("files") or [])
-            return self._send(*self.world.enqueue(username, files))
+            options = body.get("options") or {}
+            destination = options.get("destination") if isinstance(options, dict) else None
+            return self._send(*self.world.enqueue(username, files, destination))
         if path.startswith("/api/v0/transfers/downloads/"):
             username = path.rsplit("/", 1)[-1]
             files = body if isinstance(body, list) else list(body.get("files") or [])
