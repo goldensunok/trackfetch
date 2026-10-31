@@ -119,6 +119,56 @@ class TrackfetchApp:
         self.settings.download_dir = str(path)
         Path(path).expanduser().mkdir(parents=True, exist_ok=True)
         self.save_settings()
+        self.follow_download_dir_in_helper()
+
+    def follow_download_dir_in_helper(self) -> bool:
+        """Point the Soulseek helper at the folder the user just chose.
+
+        Soulseek downloads are written by the helper, not by Trackfetch, so the
+        helper has its own copy of the download folder, set when Soulseek was
+        configured. Change the folder here and say nothing, and the files keep
+        going to the old one while the screen insists otherwise. Returns True
+        when the helper's settings were rewritten, which takes effect the next
+        time it starts.
+        """
+        getter = getattr(self.registry, "existing", None)
+        provider = getter("slskd") if callable(getter) else None
+        if provider is None:
+            return False
+        try:
+            supervisor = provider.supervisor
+            if not supervisor.has_managed_config():
+                # An slskd the user set up themselves. Not ours to rewrite.
+                return False
+            from trackfetch.config.secrets import SecretStore
+
+            config = self.settings.provider("slskd").config
+            soulseek_user = str(config.get("soulseek_username") or "")
+            soulseek_password = self.secrets.get(
+                SecretStore.key_for("slskd", "soulseek_password")
+            )
+            helper_password = self.secrets.get(SecretStore.key_for("slskd", "password"))
+            if not (soulseek_user and soulseek_password and helper_password):
+                # Rewriting with anything missing would empty the helper's own
+                # credentials and break Soulseek completely. Far worse than
+                # leaving the old folder in place.
+                log.info(
+                    "Leaving the helper's settings alone: its credentials are not all "
+                    "available to rewrite them safely"
+                )
+                return False
+            supervisor.write_config(
+                soulseek_username=soulseek_user,
+                soulseek_password=soulseek_password,
+                web_username=str(config.get("username") or "slskd"),
+                web_password=helper_password,
+                downloads_dir=self.settings.resolved_download_dir(),
+            )
+        except Exception:  # pragma: no cover - never block the user's choice
+            log.debug("could not update the helper's download folder", exc_info=True)
+            return False
+        log.info("The Soulseek helper will use the new download folder when it next starts")
+        return True
 
     def refresh_provider(self, provider_id: str) -> None:
         """Recreate a provider after its settings changed."""

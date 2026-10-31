@@ -176,9 +176,39 @@ def build_report(
     else:
         lines.append("None recorded.")
 
+    section("Crashes")
+    lines.extend(_crash_summary())
+
     if extra:
         section("Extra")
         for key, value in extra.items():
             lines.append(f"{key}: {value}")
 
     return redact("\n".join(lines))
+
+
+def _crash_summary(limit: int = 60) -> list[str]:
+    """The tail of the crash note, if the program has ever died outright.
+
+    A hard crash writes nothing to the ordinary log, so without this the report
+    would say everything was fine about a program that vanished.
+    """
+    from trackfetch.diagnostics.logging_setup import crash_report_path
+
+    try:
+        path = crash_report_path()
+        if not path.exists() or path.stat().st_size == 0:
+            return ["No crash has been recorded."]
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            return ["No crash has been recorded."]
+        lines = text.splitlines()
+        # The file carries a line every time Trackfetch starts, so that a crash
+        # can be placed against a session. Those alone are not a crash, and a
+        # report full of them would look alarming when nothing is wrong.
+        marks = ("Fatal Python error", "Current thread", "Thread 0x", "Stack (most recent")
+        if not any(any(m in line for m in marks) for line in lines):
+            return ["No crash has been recorded."]
+        return [f"From {path}:", *lines[-limit:]]
+    except Exception as exc:  # pragma: no cover - defensive
+        return [f"(could not read the crash note: {exc})"]

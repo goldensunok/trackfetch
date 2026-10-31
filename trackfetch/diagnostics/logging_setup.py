@@ -19,6 +19,8 @@ from pathlib import Path
 
 from trackfetch.config.paths import app_paths
 
+log = logging.getLogger(__name__)
+
 _SENSITIVE_PATTERNS = [
     re.compile(r"(?i)(password\"?\s*[:=]\s*\"?)([^\s\",}]+)"),
     re.compile(r"(?i)(api[_-]?key\"?\s*[:=]\s*\"?)([^\s\",}]+)"),
@@ -134,4 +136,43 @@ def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> Re
     for noisy in ("httpx", "httpcore", "paramiko", "urllib3", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    enable_crash_report()
     return buffer
+
+
+#: Kept open for the life of the process. The crash handler writes straight to
+#: the file descriptor, so it must not be closed or garbage collected.
+_crash_file = None
+
+
+def crash_report_path() -> Path:
+    return app_paths().log_dir / "crash.txt"
+
+
+def enable_crash_report() -> Path | None:
+    """Make a hard crash leave a note behind.
+
+    A segmentation fault or a fault inside Qt kills the process outright:
+    nothing reaches the log, and the window simply disappears with no message.
+    Python can still write the stack of every thread as it goes down, which
+    turns "it just closed" into something a person can send on and someone can
+    read. Appended to, never truncated, so an overnight run keeps every
+    occurrence.
+    """
+    global _crash_file
+    if _crash_file is not None:
+        return crash_report_path()
+    try:
+        import faulthandler
+        import time as _time
+
+        path = crash_report_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+        handle.write(f"\n=== Trackfetch started {_time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        faulthandler.enable(file=handle, all_threads=True)
+        _crash_file = handle
+        return path
+    except Exception:  # pragma: no cover - never let this stop the program
+        log.debug("could not enable the crash report", exc_info=True)
+        return None

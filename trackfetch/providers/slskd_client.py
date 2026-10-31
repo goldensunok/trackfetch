@@ -50,6 +50,7 @@ from trackfetch.providers.errors import (
     InvalidResponse,
     RemoteServiceError,
     SlskdUnavailable,
+    SoulseekNotConnected,
 )
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,46 @@ SERVICE_NAME = "the Soulseek helper (slskd)"
 ENQUEUE_RETRIES = 6
 ENQUEUE_RETRY_DELAY = 0.4
 ENQUEUE_RETRY_MAX_DELAY = 3.0
+
+
+def slskd_error(response: httpx.Response) -> Exception:
+    """Turn a refusal from slskd into something a person can act on.
+
+    slskd explains itself in the body, in English, and that explanation is far
+    more use than the status code. When the Soulseek connection is down it says
+    so there, whether it answers 409 or 500, and the difference between "the
+    Soulseek helper refused the request" and "you are not signed in to
+    Soulseek" is the difference between a dead end and an obvious next step.
+    """
+    from trackfetch.providers._http import translate_status
+
+    try:
+        body = response.text[:400]
+    except Exception:  # pragma: no cover - defensive
+        body = ""
+    lowered = body.lower()
+    if "must be connected and logged in" in lowered or "currently: disconnected" in lowered:
+        return SoulseekNotConnected(
+            technical=f"HTTP {response.status_code}: {body}",
+            provider_id="slskd",
+        )
+    if response.status_code == 429:
+        return RemoteServiceError(
+            "The Soulseek helper is busy with another download request.",
+            "It should pass on its own. If every download fails this way, close "
+            "Trackfetch and open it again.",
+            technical=f"HTTP 429: {body}",
+            provider_id="slskd",
+        )
+    if response.status_code == 400:
+        return RemoteServiceError(
+            "The Soulseek helper would not accept that request.",
+            "Use Copy Diagnostic Information and send the result on: the "
+            "technical detail below says exactly what it objected to.",
+            technical=f"HTTP 400: {body}",
+            provider_id="slskd",
+        )
+    return translate_status(response, SERVICE_NAME, "slskd")
 
 
 def clean_search_text(text: str) -> str:
@@ -163,9 +204,7 @@ class SlskdClient:
                     method, path, raise_for_status=False, **kwargs
                 )
         if response.status_code >= 400:
-            from trackfetch.providers._http import translate_status
-
-            raise translate_status(response, SERVICE_NAME, "slskd")
+            raise slskd_error(response)
         return response
 
     def _json(self, method: str, path: str, **kwargs: Any) -> Any:
@@ -505,9 +544,7 @@ class SlskdClient:
                 self._batch_endpoint_supported = True
                 return True
             if response.status_code not in (404, 405):
-                from trackfetch.providers._http import translate_status
-
-                raise translate_status(response, SERVICE_NAME, "slskd")
+                raise slskd_error(response)
             # Only 404 and 405 mean this build predates the batch endpoint. A
             # 400 is slskd rejecting the request itself, and quietly dropping to
             # the older endpoint would hide that.
@@ -518,9 +555,7 @@ class SlskdClient:
             f"/transfers/downloads/{_quote(username)}", payload_files
         )
         if legacy.status_code >= 400:
-            from trackfetch.providers._http import translate_status
-
-            raise translate_status(legacy, SERVICE_NAME, "slskd")
+            raise slskd_error(legacy)
         return True
 
     def _send_enqueue(self, path: str, body: Any) -> httpx.Response:

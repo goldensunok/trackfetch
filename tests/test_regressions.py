@@ -1116,3 +1116,229 @@ def test_a_finished_search_is_left_for_slskd_to_clear(slskd):
 
     assert responses
     assert deletes.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# A hard crash must leave something behind
+#
+# Trackfetch died twice without writing a single line, because a crash inside
+# Qt kills the process before Python can log anything. The window simply went.
+# ---------------------------------------------------------------------------
+
+
+def test_a_crash_note_is_armed_at_startup(tmp_path, monkeypatch):
+    import faulthandler
+
+    from trackfetch.diagnostics import logging_setup
+
+    monkeypatch.setattr(logging_setup, "_crash_file", None)
+    faulthandler.disable()
+    path = logging_setup.enable_crash_report()
+
+    assert path is not None
+    assert faulthandler.is_enabled()
+    assert path.exists()
+    assert "Trackfetch started" in path.read_text(encoding="utf-8")
+
+
+def test_the_diagnostic_report_includes_a_crash(tmp_path, settings, monkeypatch):
+    from trackfetch.diagnostics import collect, logging_setup
+
+    note = tmp_path / "crash.txt"
+    note.write_text(
+        "=== Trackfetch started 2026-10-31 13:31:24 ===\n"
+        "Fatal Python error: Segmentation fault\n"
+        "Current thread 0x00007f4e7fc6b6c0 (most recent call first):\n"
+        '  File "trackfetch/gui/main_window.py", line 1 in <module>\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(logging_setup, "crash_report_path", lambda: note)
+
+    report = collect.build_report(settings)
+    assert "Crashes" in report
+    assert "Segmentation fault" in report
+
+
+def test_the_report_says_so_when_there_has_been_no_crash(tmp_path, settings, monkeypatch):
+    from trackfetch.diagnostics import collect, logging_setup
+
+    monkeypatch.setattr(logging_setup, "crash_report_path", lambda: tmp_path / "nope.txt")
+    assert "No crash has been recorded." in collect.build_report(settings)
+
+
+# ---------------------------------------------------------------------------
+# Changing the download folder must reach the Soulseek helper
+#
+# The helper writes the files, and it keeps its own copy of the folder from
+# when Soulseek was set up. Change it in Trackfetch and say nothing, and the
+# files keep going to the old place while the screen insists otherwise.
+# ---------------------------------------------------------------------------
+
+
+def _app_with_settings(tmp_path, settings, secrets):
+    from trackfetch.app import TrackfetchApp
+    from trackfetch.config.settings import SettingsStore
+    from trackfetch.storage.db import Database
+
+    class _Store(SettingsStore):
+        def __init__(self):
+            pass
+
+        def load(self):
+            return settings
+
+        def save(self, value):
+            return None
+
+    return TrackfetchApp(
+        settings_store=_Store(),
+        secrets=secrets,
+        database=Database(tmp_path / "app.sqlite3"),
+        configure_logging=False,
+    )
+
+
+class _RecordingSupervisor:
+    def __init__(self, managed=True):
+        self.managed = managed
+        self.written: list[dict] = []
+
+    def has_managed_config(self):
+        return self.managed
+
+    def write_config(self, **kwargs):
+        self.written.append(kwargs)
+        return Path("slskd.yml")
+
+    def stop(self, timeout=10.0):
+        return False
+
+    def stoppable(self):
+        return False
+
+
+def test_the_helper_follows_a_new_download_folder(tmp_path, settings, secrets):
+    from trackfetch.config.secrets import SecretStore
+
+    app = _app_with_settings(tmp_path, settings, secrets)
+    config = app.settings.provider("slskd").config
+    config["soulseek_username"] = "tobias"
+    config["username"] = "slskd"
+    secrets.set(SecretStore.key_for("slskd", "soulseek_password"), "soulseek-secret")
+    secrets.set(SecretStore.key_for("slskd", "password"), "helper-secret")
+
+    provider = app.registry.get("slskd")
+    supervisor = _RecordingSupervisor()
+    provider._supervisor = supervisor
+
+    wanted = tmp_path / "new music"
+    app.set_download_dir(wanted)
+
+    assert len(supervisor.written) == 1
+    assert supervisor.written[0]["downloads_dir"] == wanted
+    assert supervisor.written[0]["soulseek_username"] == "tobias"
+    app.shutdown()
+
+
+def test_the_helper_is_left_alone_when_a_password_is_missing(tmp_path, settings, secrets):
+    """Rewriting without the credentials would empty them and break Soulseek."""
+    app = _app_with_settings(tmp_path, settings, secrets)
+    app.settings.provider("slskd").config["soulseek_username"] = "tobias"
+    provider = app.registry.get("slskd")
+    supervisor = _RecordingSupervisor()
+    provider._supervisor = supervisor
+
+    app.set_download_dir(tmp_path / "elsewhere")
+
+    assert supervisor.written == []
+    app.shutdown()
+
+
+def test_an_slskd_the_user_set_up_is_never_rewritten(tmp_path, settings, secrets):
+    from trackfetch.config.secrets import SecretStore
+
+    app = _app_with_settings(tmp_path, settings, secrets)
+    app.settings.provider("slskd").config["soulseek_username"] = "tobias"
+    secrets.set(SecretStore.key_for("slskd", "soulseek_password"), "soulseek-secret")
+    secrets.set(SecretStore.key_for("slskd", "password"), "helper-secret")
+    provider = app.registry.get("slskd")
+    provider._supervisor = _RecordingSupervisor(managed=False)
+
+    app.set_download_dir(tmp_path / "elsewhere")
+
+    assert provider._supervisor.written == []
+    app.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# What slskd says in the body is more use than the status code
+#
+# Eight downloads failed with "the Soulseek helper refused the request", which
+# told nobody anything. slskd explains itself in plain English in the body of
+# the response, and that explanation should reach the screen.
+# ---------------------------------------------------------------------------
+
+
+def _slskd_response(status: int, body: str) -> httpx.Response:
+    return httpx.Response(status, text=body, request=httpx.Request("POST", f"{API}/searches"))
+
+
+def test_a_disconnected_soulseek_is_named_as_such_whatever_the_status():
+    from trackfetch.providers.errors import SoulseekNotConnected
+    from trackfetch.providers.slskd_client import slskd_error
+
+    # Both of these are real: 409 from searching, 500 from downloading. Checked
+    # against slskd 0.26.2 itself.
+    for status in (409, 500):
+        error = slskd_error(
+            _slskd_response(
+                status,
+                '"The server connection must be connected and logged in to perform a '
+                'search (currently: Disconnected)"',
+            )
+        )
+        assert isinstance(error, SoulseekNotConnected), status
+        assert "not signed in to Soulseek" in error.message
+        assert "one login per account" in error.remedy
+
+
+def test_a_busy_helper_is_explained_as_busy():
+    from trackfetch.providers.slskd_client import slskd_error
+
+    error = slskd_error(
+        _slskd_response(429, '"Only one concurrent operation is permitted."')
+    )
+    assert "busy with another download request" in error.message
+    assert "pass on its own" in error.remedy
+
+
+def test_a_rejected_request_keeps_slskds_own_words():
+    """The reason must survive into the diagnostic report, not be thrown away."""
+    from trackfetch.providers.slskd_client import slskd_error
+
+    error = slskd_error(
+        _slskd_response(400, '"The Destination field is not a valid relative path"')
+    )
+    assert "would not accept that request" in error.message
+    assert "Destination field" in error.technical
+
+
+def test_an_ordinary_failure_still_reads_normally():
+    from trackfetch.providers.slskd_client import slskd_error
+
+    error = slskd_error(_slskd_response(404, "not found"))
+    assert "did not recognise that request" in error.message
+
+
+def test_session_markers_alone_are_not_reported_as_crashes(tmp_path, settings, monkeypatch):
+    """Opening and closing the program many times is not a fault."""
+    from trackfetch.diagnostics import collect, logging_setup
+
+    note = tmp_path / "crash.txt"
+    note.write_text(
+        "=== Trackfetch started 2026-10-31 13:31:24 ===\n"
+        "=== Trackfetch started 2026-10-31 13:41:42 ===\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(logging_setup, "crash_report_path", lambda: note)
+    assert "No crash has been recorded." in collect.build_report(settings)
